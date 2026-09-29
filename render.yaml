@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: aion-video-specialist
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: AION_MODEL
+        value: aion-labs/aion-3.5
+      - key: AION_API_KEY
+        sync: false
+      - key: BRIDGE_API_KEY
+        generateValue: true
