@@ -11,5 +11,3 @@ services:
         value: aion-labs/aion-3.5
       - key: AION_API_KEY
         sync: false
-      - key: BRIDGE_API_KEY
-        generateValue: true

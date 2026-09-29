@@ -1,128 +1,189 @@
-import express from "express";
-import crypto from "crypto";
+import { createServer } from "node:http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
 
-const app = express();
-app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
-
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT || 10000);
+const MCP_PATH = "/mcp";
 const AION_API_KEY = process.env.AION_API_KEY;
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const AION_MODEL = process.env.AION_MODEL || "aion-labs/aion-3.5";
 const AION_URL = "https://api.aionlabs.ai/v1/chat/completions";
 
-function secureEqual(a = "", b = "") {
-  const aa = Buffer.from(a);
-  const bb = Buffer.from(b);
-  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
-}
+async function callAion({ prompt, context = "", reasoning_effort = "high", max_tokens = 8000 }) {
+  if (!AION_API_KEY) throw new Error("AION_API_KEY is not configured.");
 
-function authorize(req, res, next) {
-  if (!BRIDGE_API_KEY) {
-    return res.status(503).json({ error: "Bridge authentication is not configured." });
+  const messages = [];
+  if (context.trim()) {
+    messages.push({
+      role: "system",
+      content:
+        "Use the following user-supplied context when relevant. Preserve the user's current request as the controlling task. Do not claim facts from the context were independently verified.\n\n" +
+        context.trim(),
+    });
   }
-  const auth = req.get("authorization") || "";
-  const supplied = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!secureEqual(supplied, BRIDGE_API_KEY)) {
-    return res.status(401).json({ error: "Unauthorized." });
-  }
-  next();
-}
+  messages.push({ role: "user", content: prompt.trim() });
 
-app.get("/", (_req, res) => {
-  res.json({ service: "Aion Video Specialist", status: "ok" });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    aion_key_configured: Boolean(AION_API_KEY),
-    bridge_auth_configured: Boolean(BRIDGE_API_KEY),
-    model: AION_MODEL
+  const upstream = await fetch(AION_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${AION_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: AION_MODEL,
+      messages,
+      reasoning_effort,
+      reasoning_split: true,
+      max_tokens,
+    }),
+    signal: AbortSignal.timeout(120000),
   });
-});
 
-app.post("/ask-aion", authorize, async (req, res) => {
-  try {
-    if (!AION_API_KEY) {
-      return res.status(503).json({ error: "AION_API_KEY is not configured." });
-    }
+  const raw = await upstream.text();
+  let data;
+  try { data = JSON.parse(raw); } catch { data = { raw }; }
 
-    const { prompt, context = "", reasoning_effort = "high", max_tokens = 8000 } = req.body || {};
-
-    if (typeof prompt !== "string" || !prompt.trim()) {
-      return res.status(400).json({ error: "prompt is required." });
-    }
-    if (typeof context !== "string") {
-      return res.status(400).json({ error: "context must be a string." });
-    }
-
-    const allowedEffort = new Set(["low", "high", "max"]);
-    if (!allowedEffort.has(reasoning_effort)) {
-      return res.status(400).json({ error: "reasoning_effort must be low, high, or max." });
-    }
-
-    const boundedMaxTokens = Math.max(1, Math.min(Number(max_tokens) || 8000, 32768));
-
-    const messages = [];
-    if (context.trim()) {
-      messages.push({
-        role: "system",
-        content:
-          "The following is durable and/or project-specific context supplied by the user. Use it when relevant, but follow the user's current request as the task.\n\n" +
-          context.trim()
-      });
-    }
-    messages.push({ role: "user", content: prompt.trim() });
-
-    const upstream = await fetch(AION_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${AION_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: AION_MODEL,
-        messages,
-        reasoning_effort,
-        reasoning_split: true,
-        max_tokens: boundedMaxTokens
-      }),
-      signal: AbortSignal.timeout(120000)
-    });
-
-    const raw = await upstream.text();
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      data = { raw };
-    }
-
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({
-        error: "Aion request failed.",
-        upstream_status: upstream.status,
-        details: data
-      });
-    }
-
-    const message = data?.choices?.[0]?.message || {};
-    return res.json({
-      model: data?.model || AION_MODEL,
-      response: message.content || "",
-      usage: data?.usage || null,
-      finish_reason: data?.choices?.[0]?.finish_reason || null
-    });
-  } catch (err) {
-    const timeout = err?.name === "TimeoutError";
-    return res.status(timeout ? 504 : 500).json({
-      error: timeout ? "Aion request timed out." : "Bridge request failed.",
-      message: err?.message || String(err)
-    });
+  if (!upstream.ok) {
+    const err = new Error(`Aion request failed with HTTP ${upstream.status}`);
+    err.details = data;
+    throw err;
   }
+
+  const msg = data?.choices?.[0]?.message || {};
+  return {
+    model: data?.model || AION_MODEL,
+    response: msg.content || "",
+    usage: data?.usage || null,
+    finish_reason: data?.choices?.[0]?.finish_reason || null,
+  };
+}
+
+function createAionServer() {
+  const server = new McpServer(
+    { name: "aion-video-specialist", version: "2.0.0" },
+    {
+      instructions:
+        "Use ask_aion when the user explicitly asks to consult Aion or when the Aion Video Specialist is invoked. Pass permanent video context and current-series context in the context field. Return Aion's visible answer; do not invent or expose hidden reasoning.",
+    }
+  );
+
+  server.registerTool(
+    "ask_aion",
+    {
+      title: "Ask Aion",
+      description:
+        "Send a prompt and optional video-development context to Aion 3.5 and return Aion's visible response. Use for Aion-assisted ideation, research synthesis, script development, critique, and production-package generation.",
+      inputSchema: {
+        prompt: z.string().min(1).describe("The current instruction or question for Aion."),
+        context: z.string().optional().default("").describe(
+          "Optional permanent Aion Video Context plus any current video/series context."
+        ),
+        reasoning_effort: z.enum(["low", "high", "max"]).optional().default("high"),
+        max_tokens: z.number().int().min(1).max(32768).optional().default(8000),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        const result = await callAion(args);
+        return {
+          content: [{ type: "text", text: result.response }],
+          structuredContent: result,
+        };
+      } catch (error) {
+        const detail = error?.details ? `\n${JSON.stringify(error.details)}` : "";
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: `Ask Aion failed: ${error?.message || String(error)}${detail}`,
+          }],
+        };
+      }
+    }
+  );
+
+  return server;
+}
+
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "content-type, mcp-session-id, mcp-protocol-version");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+}
+
+const httpServer = createServer(async (req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ service: "Aion Video Specialist", version: "2.0.0", mcp: MCP_PATH }));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      version: "2.0.0",
+      aion_key_configured: Boolean(AION_API_KEY),
+      model: AION_MODEL,
+      mcp_endpoint: MCP_PATH,
+    }));
+    return;
+  }
+
+  // During unauthenticated development, explicitly return 404 for OAuth discovery.
+  if (
+    url.pathname === "/.well-known/oauth-protected-resource" ||
+    url.pathname === "/.well-known/oauth-authorization-server"
+  ) {
+    res.writeHead(404).end("Not Found");
+    return;
+  }
+
+  if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
+    setCors(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (url.pathname === MCP_PATH && ["POST", "GET", "DELETE"].includes(req.method || "")) {
+    setCors(res);
+    const server = createAionServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    res.on("close", () => {
+      transport.close().catch(() => {});
+      server.close().catch(() => {});
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("MCP request error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal MCP server error" }));
+      }
+    }
+    return;
+  }
+
+  res.writeHead(404).end("Not Found");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Aion Video Specialist listening on ${PORT}`);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log(`Aion Video Specialist v2 listening on ${PORT}${MCP_PATH}`);
 });
