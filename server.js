@@ -1,10 +1,40 @@
 import { createServer } from "node:http";
+import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 const PORT = Number(process.env.PORT || 10000);
 const MCP_PATH = "/mcp";
+const jobs = new Map();
+const JOB_TTL_MS = 60 * 60 * 1000;
+const QUICK_WAIT_MS = 18000;
+function pruneJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+}
+function submitJob(args) {
+  pruneJobs();
+  const id = crypto.randomUUID();
+  const job = { id, createdAt: Date.now(), status: "running" };
+  jobs.set(id, job);
+  job.promise = callAion(args).then(result => {
+    if (!result.response?.trim()) {
+      job.status = "failed";
+      job.error = result.finish_reason === "length"
+        ? "Aion exhausted max_tokens before producing visible text. Retry with a larger max_tokens budget or break the assignment into smaller parts."
+        : "Aion returned no visible text.";
+      job.usage = result.usage;
+    } else { job.status = "completed"; job.result = result; }
+  }).catch(error => { job.status = "failed"; job.error = error?.message || String(error); });
+  return job;
+}
+function jobPayload(job) {
+  if (job.status === "completed") return { job_id: job.id, status: job.status, ...job.result };
+  if (job.status === "failed") return { job_id: job.id, status: job.status, error: job.error, usage: job.usage || null };
+  return { job_id: job.id, status: "running", message: "Aion is still processing. Call get_aion_result with this job_id." };
+}
+function toolResult(payload) { return { content: [{ type: "text", text: payload.response || JSON.stringify(payload) }], structuredContent: payload }; }
 const AION_API_KEY = process.env.AION_API_KEY;
 const AION_MODEL = process.env.AION_MODEL || "aion-labs/aion-3.5";
 const AION_URL = "https://api.aionlabs.ai/v1/chat/completions";
@@ -36,7 +66,7 @@ async function callAion({ prompt, context = "", reasoning_effort = "high", max_t
       reasoning_split: true,
       max_tokens,
     }),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(300000),
   });
 
   const raw = await upstream.text();
@@ -89,22 +119,27 @@ function createAionServer() {
       },
     },
     async (args) => {
-      try {
-        const result = await callAion(args);
-        return {
-          content: [{ type: "text", text: result.response }],
-          structuredContent: result,
-        };
-      } catch (error) {
-        const detail = error?.details ? `\n${JSON.stringify(error.details)}` : "";
-        return {
-          isError: true,
-          content: [{
-            type: "text",
-            text: `Ask Aion failed: ${error?.message || String(error)}${detail}`,
-          }],
-        };
-      }
+      const job = submitJob(args);
+      await Promise.race([
+        job.promise,
+        new Promise(resolve => setTimeout(resolve, QUICK_WAIT_MS)),
+      ]);
+      return toolResult(jobPayload(job));
+    }
+  );
+
+  server.registerTool(
+    "get_aion_result",
+    {
+      title: "Get Aion Result",
+      description: "Retrieve the result of an Aion request that returned a running job_id. Poll until status is completed or failed.",
+      inputSchema: { job_id: z.string().uuid() },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ job_id }) => {
+      pruneJobs();
+      const job = jobs.get(job_id);
+      return toolResult(job ? jobPayload(job) : { job_id, status: "not_found", message: "Job not found or expired; try submitting the request again." });
     }
   );
 
